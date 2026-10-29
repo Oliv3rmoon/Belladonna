@@ -107,6 +107,12 @@ sceVideoOutOpen(int32_t user, int32_t bus, int32_t index, const void *parameter)
 }
 
 static int
+sceVideoOutClose(int32_t handle)
+{
+   return 0;
+}
+
+static int
 sceVideoOutSetFlipRate(int32_t handle, int32_t rate)
 {
    return 0;
@@ -250,6 +256,8 @@ struct wsi_videoout_present {
 struct wsi_videoout_output {
    mtx_t lock;
    cnd_t changed;
+   unsigned owners;
+   bool closing, stop;
    bool opened;
    int handle;
    bool high_frame_rate;
@@ -260,6 +268,8 @@ struct wsi_videoout_output {
    struct wsi_videoout_set {
       const struct wsi_videoout_size *size;
       uint8_t *buffers;
+      int64_t physical;
+      size_t bytes;
    } sets[VIDEOOUT_SIZES];
    uint32_t set_count;
    /* The argument of the latest flip submitted; each flip's is one more. */
@@ -319,19 +329,8 @@ struct wsi_videoout {
 static bool
 videoout_title_declares_high_frame_rate(void)
 {
-   const char *const path = getenv("PS5_VIDEOOUT_PARAM_JSON");
-   FILE *const file = fopen(path != NULL && path[0] != '\0' ? path : "/app0/sce_sys/param.json", "rb");
-   if (file == NULL)
-      return false;
-   char text[16384];
-   const size_t length = fread(text, 1, sizeof(text) - 1, file);
-   fclose(file);
-   text[length] = '\0';
-   const char *at = strstr(text, "\"attribute3\"");
-   if (at == NULL || (at = strchr(at, ':')) == NULL)
-      return false;
-   const unsigned long value = strtoul(at + 1, NULL, 0);
-   return (value & VIDEOOUT_ATTRIBUTE3_HIGH_FRAME_RATE) == VIDEOOUT_ATTRIBUTE3_HIGH_FRAME_RATE;
+   const char *const asked = getenv("EDEN_VIDEOOUT_120HZ");
+   return asked != NULL && asked[0] == '1';
 }
 
 /* The refresh period: the median of a few intervals between vblank waits,
@@ -390,7 +389,7 @@ videoout_open_locked(void)
       if (out->high_frame_rate) {
          /* A period of 0 is a failed wait: never taken for 119.88 Hz */
          const uint64_t period = videoout_vblank_period_ns(out->handle);
-         if (period == 0 || period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS) {
+         if (period == 0 || (period > UINT64_C(15000000) && period < UINT64_C(18500000))) {
             sceVideoOutConfigureOutput(out->handle, PS5_VIDEO_OUT_MODE_RESTORE, NULL, NULL, NULL);
             out->high_frame_rate = false;
             if (period == 0)
@@ -399,6 +398,8 @@ videoout_open_locked(void)
                fprintf(stderr,
                        "wsi/videoout: 119.88 Hz accepted, but a vblank comes every %.3f ms; 59.94 Hz restored\n",
                        (double)period / 1e6);
+         } else {
+            fprintf(stderr, "wsi/videoout: 119.88 Hz output, a vblank every %.3f ms\n", (double)period / 1e6);
          }
       } else if (supported > 0) {
          fprintf(stderr, "wsi/videoout: 119.88 Hz refused (%d); presenting at 59.94 Hz\n", configured);
@@ -462,8 +463,8 @@ videoout_register_locked(const struct wsi_videoout_size *size, const struct wsi_
    const uint32_t index = out->set_count;
    const size_t bytes = VIDEOOUT_BUFFERS * size->buffer_bytes;
    uint8_t *buffers = NULL;
-#if defined(__PROSPERO__)
    int64_t physical = -1;
+#if defined(__PROSPERO__)
    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bytes, VIDEOOUT_BUFFER_ALIGNMENT,
                                      PS5_KERNEL_DIRECT_TYPE_CPU, &physical) != 0)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -505,7 +506,8 @@ videoout_register_locked(const struct wsi_videoout_size *size, const struct wsi_
    }
    fprintf(stderr, "wsi/videoout: %ux%u framebuffers registered as set %u, buffers %u-%u\n", size->extent.width,
            size->extent.height, index, index * VIDEOOUT_BUFFERS, index * VIDEOOUT_BUFFERS + VIDEOOUT_BUFFERS - 1);
-   out->sets[index] = (struct wsi_videoout_set){.size = size, .buffers = buffers};
+   out->sets[index] = (struct wsi_videoout_set){.size = size, .buffers = buffers, .physical = physical,
+                                                .bytes = bytes};
    out->set_count = index + 1;
    *set_out = &out->sets[index];
    return VK_SUCCESS;
@@ -527,8 +529,12 @@ videoout_flip_thread(void *data)
    struct wsi_videoout_output *out = &videoout_output;
    mtx_lock(&out->lock);
    for (;;) {
-      while (out->queue_count == 0)
+      while (out->queue_count == 0 && !out->stop)
          cnd_wait(&out->changed, &out->lock);
+      if (out->queue_count == 0 && out->stop) {
+         mtx_unlock(&out->lock);
+         return 0;
+      }
       const struct wsi_videoout_present present = out->queue[out->queue_head];
       mtx_unlock(&out->lock);
 
@@ -1208,6 +1214,85 @@ videoout_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice device
 
 /* --- The interface ------------------------------------------------------- */
 
+/* Eden switches between SDL, OpenGL and Vulkan within one process. Keep the
+ * output shared between live WSI owners, but release it after the last owner. */
+static void
+videoout_ref(void)
+{
+   struct wsi_videoout_output *out = &videoout_output;
+   mtx_lock(&out->lock);
+   while (out->closing)
+      cnd_wait(&out->changed, &out->lock);
+   out->owners++;
+   mtx_unlock(&out->lock);
+}
+
+static void
+videoout_unref(void)
+{
+   struct wsi_videoout_output *out = &videoout_output;
+   mtx_lock(&out->lock);
+   assert(out->owners > 0);
+   if (--out->owners != 0) {
+      mtx_unlock(&out->lock);
+      return;
+   }
+   /* Vulkan requires swapchains to be destroyed before their device. Their
+    * destruction drains in_flight, so no worker references remain here. */
+   assert(out->queue_count == 0 && out->current == NULL);
+   out->closing = true;
+   out->stop = true;
+   cnd_broadcast(&out->changed);
+   const bool join = out->thread_started;
+   mtx_unlock(&out->lock);
+   if (join)
+      thrd_join(out->thread, NULL);
+   mtx_lock(&out->lock);
+   out->thread_started = false;
+   out->stop = false;
+
+   /* A session at 119.88 Hz hands the output back at 59.94 Hz, as it found it. */
+   if (out->handle >= 0 && out->high_frame_rate) {
+      const int restored = sceVideoOutConfigureOutput(out->handle, PS5_VIDEO_OUT_MODE_RESTORE, NULL, NULL, NULL);
+      fprintf(stderr, "wsi/videoout: 59.94 Hz restored: 0x%08x\n", (unsigned)restored);
+   }
+   const int closed = out->handle >= 0 ? sceVideoOutClose(out->handle) : 0;
+   if (closed == 0) {
+      /* Successful close ends display ownership, including pending flips.
+       * Never release scanout memory when close fails. */
+      for (uint32_t i = 0; i < out->set_count; i++) {
+         struct wsi_videoout_set *const set = &out->sets[i];
+         if (!set->buffers)
+            continue;
+#if defined(__PROSPERO__)
+         if (sceKernelMunmap(set->buffers, set->bytes) == 0) {
+            if (sceKernelReleaseDirectMemory(set->physical, set->bytes) != 0)
+               fprintf(stderr, "wsi/videoout: scanout direct-memory release failed\n");
+         } else {
+            fprintf(stderr, "wsi/videoout: scanout unmap failed; retaining allocation\n");
+         }
+#else
+         munmap(set->buffers, set->bytes);
+#endif
+      }
+      memset(out->sets, 0, sizeof(out->sets));
+      out->set_count = 0;
+      out->handle = -1;
+      out->opened = false;
+      out->high_frame_rate = false;
+      out->modes_settled = false;
+      out->high_mode_offered = false;
+      out->flip_argument = 0;
+      out->queue_head = 0;
+      memset(out->buffer, 0, sizeof(out->buffer));
+   } else {
+      fprintf(stderr, "wsi/videoout: close failed: 0x%08x; retaining scanout memory\n", (unsigned)closed);
+   }
+   out->closing = false;
+   cnd_broadcast(&out->changed);
+   mtx_unlock(&out->lock);
+}
+
 VkResult
 wsi_display_init_wsi(struct wsi_device *wsi_device, const VkAllocationCallbacks *alloc, int display_fd)
 {
@@ -1218,6 +1303,8 @@ wsi_display_init_wsi(struct wsi_device *wsi_device, const VkAllocationCallbacks 
    }
 
    call_once(&videoout_once, videoout_output_init_once);
+
+   videoout_ref();
 
    wsi->base.get_support = videoout_surface_get_support;
    wsi->base.get_capabilities2 = videoout_surface_get_capabilities2;
@@ -1235,8 +1322,11 @@ void
 wsi_display_finish_wsi(struct wsi_device *wsi_device, const VkAllocationCallbacks *alloc)
 {
    struct wsi_videoout *wsi = (struct wsi_videoout *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_DISPLAY];
-   if (wsi)
+   if (wsi) {
+      videoout_unref();
       vk_free(alloc, wsi);
+      wsi_device->wsi[VK_ICD_WSI_PLATFORM_DISPLAY] = NULL;
+   }
 }
 
 void

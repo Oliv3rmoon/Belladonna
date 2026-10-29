@@ -2719,6 +2719,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 
    pdev->addrlib = ac_addrlib_create(&pdev->info, &pdev->info.max_alignment);
    if (!pdev->addrlib) {
+      fprintf(stderr, "radv/ps5: addrlib creation failed\n");
       result = VK_ERROR_INITIALIZATION_FAILED;
       goto fail_wsi;
    }
@@ -2952,6 +2953,7 @@ radv_ps5_enumerate_physical_devices(struct vk_instance *vk_instance)
 {
    struct radv_physical_device *pdev;
    VkResult result = radv_physical_device_try_create((struct radv_instance *)vk_instance, NULL, &pdev);
+   if (result != VK_SUCCESS) fprintf(stderr, "radv/ps5: physical device creation result=%d\n", result);
    if (result == VK_ERROR_INCOMPATIBLE_DRIVER || result == VK_ERROR_INITIALIZATION_FAILED)
       return VK_SUCCESS;
    if (result != VK_SUCCESS)

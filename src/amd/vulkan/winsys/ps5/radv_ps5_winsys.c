@@ -30,13 +30,18 @@ static void
 radv_ps5_queue_create(void)
 {
    struct radv_ps5_queue *const queue = &radv_ps5_queue_storage;
-   if (!radv_ps5_platform_init())
+   if (!radv_ps5_platform_init()) {
+      fprintf(stderr, "radv/ps5: queue platform initialization failed\n");
       return;
+   }
    /* The words the GPU runs and the marker it writes live in the window, where
     * ps5vk's submission buffer has always been. */
-   if (!radv_ps5_memory_alloc(RADV_PS5_RING_BYTES, RADV_PS5_LARGE_BYTES, true, &queue->ring))
+   if (!radv_ps5_memory_alloc(RADV_PS5_RING_BYTES, RADV_PS5_LARGE_BYTES, true, &queue->ring)) {
+      fprintf(stderr, "radv/ps5: queue ring allocation failed\n");
       return;
+   }
    if (!radv_ps5_memory_alloc(RADV_PS5_PAGE_BYTES, RADV_PS5_PAGE_BYTES, true, &queue->marker_memory)) {
+      fprintf(stderr, "radv/ps5: queue marker allocation failed\n");
       radv_ps5_memory_free(&queue->ring);
       return;
    }

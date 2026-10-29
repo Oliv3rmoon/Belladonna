@@ -517,7 +517,10 @@ radv_ps5_note_submission(uint32_t words, uint64_t claim_ns, uint64_t copy_ns)
    radv_ps5_submit_window.words += words;
    radv_ps5_submit_window.claim_ns += claim_ns;
    radv_ps5_submit_window.copy_ns += copy_ns;
-   if (now - radv_ps5_submit_window.window_start < 10ull * 1000 * 1000 * 1000)
+   static int statistics = -1;
+   if (statistics < 0)
+      statistics = getenv("RADV_PS5_SUBMIT_STATS") != NULL;
+   if (!statistics || now - radv_ps5_submit_window.window_start < 10ull * 1000 * 1000 * 1000)
       return;
    uint64_t times[3];
    radv_ps5_submit_times(times);
